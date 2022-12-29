@@ -5,6 +5,10 @@
 // up to 512 bytes --- allocate 4KiB memory pool, block-size
 // up to 256 KiB -- allocate 2MiB memory pool, block-size
 // over 256 KiB -- allocate >= 128MiB dynamic-sized memory pool, free-list
+// 32 MiB for internal data structures
+
+// lock order is always
+// block pool -> (page pool ->) list pool -> internal pool
 
 #include "memory_pool.h"
 
@@ -15,7 +19,6 @@
 #include <atomic>
 #include <shared_mutex>
 #include <mutex>
-#include <cassert>
 
 #include <Windows.h>
 
@@ -24,17 +27,21 @@ class MemoryManager
 public:
 	virtual void* allocate(size_t size) = 0;
 	virtual void free(void* ptr) = 0;
+	virtual size_t reportFreeSpace() = 0;
+	virtual size_t reportTotalSpace() = 0;
 };
 
 namespace CustomMemoryManagerConstants
 {
 	constexpr size_t MAX_MEMORY = 64LL * (1 << 30);
-	constexpr size_t PAGE_SIZE = 2 * (1 << 20); // = 1 << PAGE_BIT
+	constexpr size_t INTERNAL_POOL_SIZE = 32 * (1 << 20);
+	constexpr size_t INITIAL_HUGE_POOL_SIZE = 128 * (1 << 20);
 	constexpr int TOTAL_PAGE_NUM = MAX_MEMORY >> 21;
 	constexpr size_t SMALL_THRESHOLD = 512;
 	constexpr size_t LARGE_THRESHOLD = 256 * (1 << 10);
 	constexpr size_t SMALL_POOL_SIZE = 4 * (1 << 10);
 	constexpr size_t LARGE_POOL_SIZE = 2 * (1 << 20);
+	constexpr size_t SMALL_PAGE_NUM_PER_LARGE_PAGE = LARGE_POOL_SIZE / SMALL_POOL_SIZE;
 	const std::array<size_t, 23> SMALL_BLOCK_SIZES
 		= {
 			8, 16, 24, 32, 40, 48, 56, 64, 72, 88, 104, 120, 136,
@@ -49,6 +56,7 @@ namespace CustomMemoryManagerConstants
 			59216, 66624, 74952, 84328, 94872, 106736, 120080, 135096,
 			151984, 170984, 192360, 216408, 243464, 262144
 	};
+	constexpr size_t PAGE_SIZE = LARGE_POOL_SIZE;
 	//std::vector<size_t> CustomMemoryManager::makeBlockSizes(int min, int max)
 	//{
 	//	std::vector<size_t> ret;
@@ -64,9 +72,10 @@ namespace CustomMemoryManagerConstants
 	//	}
 	//	return ret;
 	//}
-	size_t getPageAddress(void* ptr);
-	int getPageNum(size_t ptr);
-	int getPageNum(void* ptr);
+	size_t getPageNum(size_t ptr);
+	size_t getPageNum(void* ptr);
+	int getPageHash(size_t ptr);
+	int getPageHash(void* ptr);
 	int getSmallPageNum(size_t ptr);
 	int getSmallPageNum(void* ptr);
 }
@@ -75,38 +84,30 @@ class Page
 {
 public:
 	enum class PageType {
-		HUGE, LARGE, SMALL,
+		INTERNAL, HUGE, LARGE, SMALL,
 	};
 	const PageType t;
-	const size_t baseAddress;
+	const size_t pageNum;
 	MemoryListPool* const hugePool;
-	Page(MemoryListPool* hugePool, size_t baseAddress) :
-		t(PageType::HUGE), hugePool(hugePool), baseAddress(baseAddress) {}
-protected:
-	Page(PageType t, MemoryListPool* hugePool, size_t baseAddress) :
-		t(t), hugePool(hugePool), baseAddress(baseAddress) {}
+	Page(PageType t, MemoryListPool* hugePool, size_t pageNum) :
+		t(t), hugePool(hugePool), pageNum(pageNum) {}
 };
 
-class LargePoolPage : public Page
+class LargeBlockPoolPage : public Page
 {
 public:
-	MemoryBlockPool* const pool;
-	LargePoolPage(MemoryListPool* hugePool, size_t baseAddress, MemoryBlockPool* pool) :
-		Page(PageType::LARGE, hugePool, baseAddress), pool(pool) {}
+	MemoryBlockPool dataPool;
+	LargeBlockPoolPage(MemoryListPool* hugePool, size_t pageNum, CustomMemoryManager* manager, void* baseAddress, int poolSize, int blockSize, std::list<MemoryBlockPool*>& freePools) :
+		Page(PageType::LARGE, hugePool, pageNum), dataPool{ manager, baseAddress, poolSize, blockSize, freePools } {}
 };
 
-class SmallPoolPage : public Page
+class SmallBlockPoolPage : public Page
 {
-	static constexpr size_t LARGE_PAGE_SIZE = 2 * (1 << 20);
-	static constexpr size_t SMALL_PAGE_SIZE = 4 * (1 << 10);
 public:
-	MemoryBlockPool* const pool;
-	std::array<MemoryBlockPool*, LARGE_PAGE_SIZE / SMALL_PAGE_SIZE> smallPools{};
-	SmallPoolPage(MemoryListPool* hugePool, size_t baseAddress, MemoryBlockPool* pool) :
-		Page(PageType::SMALL, hugePool, baseAddress), pool(pool) {}
-
-	void* allocate(CustomMemoryManager* manager, int blockSize, std::list<MemoryBlockPool*>& freeSmallPools);
-	size_t free(void* ptr);
+	MemoryBlockPool dataPool;
+	std::array<MemoryBlockPool*, CustomMemoryManagerConstants::SMALL_PAGE_NUM_PER_LARGE_PAGE> smallPools{};
+	SmallBlockPoolPage(MemoryListPool* hugePool, size_t pageNum, CustomMemoryManager* manager, void* baseAddress, int poolSize, int blockSize, std::list<MemoryBlockPool*>& freePools) :
+		Page(PageType::SMALL, hugePool, pageNum), dataPool{ manager, baseAddress, poolSize, blockSize, freePools } {}
 };
 
 class CustomMemoryManager : public MemoryManager
@@ -114,7 +115,10 @@ class CustomMemoryManager : public MemoryManager
 public:
 	void* allocate(size_t size) override final;
 	void free(void* ptr) override final;
+	size_t reportFreeSpace() override final;
+	size_t reportTotalSpace() override final;
 	CustomMemoryManager();
+	~CustomMemoryManager();
 
 private:
 	std::array<std::list<MemoryBlockPool*>, 23> freeSmallPools{};
@@ -123,27 +127,30 @@ private:
 	std::array<std::shared_mutex, 53> largeMutexes{};
 	
 	std::shared_mutex smallPagePoolMutex;
-	std::list<MemoryBlockPool*> freeLargePoolsForSmallPages;
+	std::list<MemoryBlockPool*> freeSmallBlockPoolPages;
 
-	std::shared_mutex hugePoolMutex;
-	std::vector<MemoryListPool> hugePools;
-	size_t nextHugePoolSize = 128 * (1 << 20);
+	std::shared_mutex hugePoolsMutex;
+	std::vector<MemoryListPool*> hugePools;
 	std::array<std::vector<Page*>, CustomMemoryManagerConstants::TOTAL_PAGE_NUM> pages{};
+	size_t nextHugePoolSize = CustomMemoryManagerConstants::INITIAL_HUGE_POOL_SIZE;
+
+	std::shared_mutex internalPoolMutex;
+	MemoryListPool internalPool;
 
 private:
-	void* allocateFromBlockPool(std::shared_mutex& mutex, std::list<MemoryBlockPool*>& pools, bool isSmallPool, int blockSize);
-	void freeFromBlockPool(void* ptr, MemoryBlockPool* pool, std::shared_mutex& mutex, std::list<MemoryBlockPool*>& pools, bool isSmallPool);
-	
-	void* allocateFromListPool(size_t size);
-	void freeFromListPool(void* ptr, MemoryListPool* pool);
-
-	MemoryBlockPool* allocateLargePage(int blockSize, std::list<MemoryBlockPool*>& pools);
-	MemoryBlockPool* allocatePageForSmallPools();
-	MemoryBlockPool* allocatePage(bool forSmallPages, int blockSize, std::list<MemoryBlockPool*>& pools);
-	void freePage(void* ptr);
-	
-	MemoryBlockPool* allocateSmallPage(int blockSize, std::list<MemoryBlockPool*>& pools);
-	void freeSmallPage(void* ptr);
-	
 	void grow();
+
+	void* allocateFromBlockPool(std::shared_mutex& mutex, std::list<MemoryBlockPool*>& pools, bool isSmallPool, int blockSize);
+	void* allocateFromListPool(size_t size);
+	void* allocateFromInternalPool(size_t size);
+	MemoryBlockPool* allocateSmallPage(int blockSize, std::list<MemoryBlockPool*>& pools);
+	MemoryBlockPool* allocateLargeBlockPoolPage(int blockSize, std::list<MemoryBlockPool*>& pools);
+	MemoryBlockPool* allocateSmallBlockPoolPage();
+	MemoryBlockPool* allocatePage(bool forSmallPages, int blockSize, std::list<MemoryBlockPool*>& pools);
+
+	void freeFromBlockPool(void* ptr, MemoryBlockPool* pool, std::shared_mutex& mutex, std::list<MemoryBlockPool*>& pools, bool isSmallPool);
+	void freeFromListPool(void* ptr, MemoryListPool* pool);
+	void freeFromInternalPool(void* ptr);
+	void freeSmallPage(void* ptr);
+	void freePage(void* ptr);
 };

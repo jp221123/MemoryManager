@@ -10,7 +10,7 @@
 class CustomMemoryManager;
 class MemoryPool
 {
-protected:
+public:
 	CustomMemoryManager* const manager;
 	const bool isBlockPool;
 public:
@@ -27,11 +27,13 @@ protected:
 
 class MemoryBlockPool : public MemoryPool
 {
-	struct Entry
-	{
-		SLIST_ENTRY listEntry;
-		void* address;
-	};
+	//struct Entry
+	//{
+	//	SLIST_ENTRY listEntry;
+	//	void* address;
+	//	Entry(void* address) :
+	//		address(address) {}
+	//};
 public:
 	void* const baseAddress;
 	std::atomic<int> freeSpace;
@@ -40,8 +42,11 @@ public:
 	const int poolSize;
 	const int blockSize;
 private:
+	//const int entrySize;
+	const int numBlock;
 	PSLIST_HEADER freeHead;
-
+	const size_t slistAddress;
+	const size_t dataAddress;
 public:
 	MemoryBlockPool(CustomMemoryManager* manager, void* baseAddress, int poolSize, int blockSize, std::list<MemoryBlockPool*>& freePools);
 	void* allocate(size_t size) override final;
@@ -52,29 +57,26 @@ class MemoryListPool : public MemoryPool
 {
 	struct Entry
 	{
-		Entry *prev, *next;
 		void* address;
 		size_t size;
-		bool isOnList;
-		std::list<Entry*>::iterator it;
-		Entry(Entry* prev, Entry* next, void* address, size_t size) :
-			prev(prev), next(next), address(address), size(size), isOnList(false) {}
-		Entry(Entry* prev, Entry* next, void* address, size_t size, std::list<Entry*>& freeList):
-			prev(prev), next(next), address(address), size(size), isOnList(true)
-		{
-			freeList.push_front(this);
-			it = freeList.begin();
-		}
+		bool isOnFreeList;
+		std::list<std::list<Entry>::iterator>::iterator freeListIt;
+		Entry(void* address, size_t size, bool isOnFreeList) :
+			address(address), size(size), isOnFreeList(isOnFreeList) {}
 	};
 public:
 	void* const baseAddress;
 	const size_t poolSize;
 	size_t freeSpace;
 private:
-	std::list<Entry*> freeList;
-	std::map<void*, Entry*> usedList;
+	std::list<Entry> entryList;
+	std::list<std::list<Entry>::iterator> freeList;
+	std::map<void*, std::list<Entry>::iterator> usedMap;
+	//Entry* entryListHead;
+	//Entry* freeListHead;
 public:
-	MemoryListPool(CustomMemoryManager* manager, void* baseAddress, size_t poolSize);
+	MemoryListPool(CustomMemoryManager* manager, size_t poolSize);
+	~MemoryListPool();
 	void* allocate(size_t size) override final;
 	size_t free(void* ptr) override final;
 	void* allocateAligned(size_t size);
